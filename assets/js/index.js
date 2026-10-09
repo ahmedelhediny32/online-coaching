@@ -302,6 +302,43 @@ const today=()=>new Date().toISOString().slice(0,10);
 const ago=n=>{const d=new Date();d.setDate(d.getDate()-n);return d.toISOString().slice(0,10)};
 const fmt=n=>Math.round(n).toLocaleString(APP.lang==='ar'?'ar-EG':'en-US');
 const TD=s=>APP.lang==='ar'?`<span style="unicode-bidi:plaintext">${esc(s)}</span>`:esc(s);
+const normalizeEmail=(v='')=>String(v ?? '').trim().toLowerCase();
+const normalizePass=(v='')=>String(v ?? '').trim();
+
+function readLocalDB(){
+  try {
+    return JSON.parse(localStorage.getItem(DBK) || 'null');
+  } catch (e) {
+    return null;
+  }
+}
+
+function mergeDbState(remote={}, local=null){
+  const base = local && Array.isArray(local.users) ? local : seedDB();
+  const merged = {...seedDB(), ...base, ...remote};
+  const users = [...(base.users||[]), ...((remote.users||[]) || [])];
+  const map = new Map();
+  users.forEach(u => {
+    const key = u.id || normalizeEmail(u.email);
+    const existing = map.get(key) || map.get(normalizeEmail(u.email));
+    if (existing) {
+      map.set(key, {...existing, ...u, email: normalizeEmail(u.email || existing.email)});
+      map.set(normalizeEmail(u.email || existing.email), map.get(key));
+    } else {
+      const clean = {...u, email: normalizeEmail(u.email)};
+      map.set(key, clean);
+      map.set(normalizeEmail(clean.email), clean);
+    }
+  });
+  merged.users = [...map.values()].map(u => ({...u, email: normalizeEmail(u.email), pass: normalizePass(u.pass || '')}));
+  merged.plans = Array.isArray(remote.plans) ? remote.plans : Array.isArray(base.plans) ? base.plans : [];
+  merged.nutri = Array.isArray(remote.nutri) ? remote.nutri : Array.isArray(base.nutri) ? base.nutri : [];
+  merged.records = Array.isArray(remote.records) ? remote.records : Array.isArray(base.records) ? base.records : [];
+  merged.messages = Array.isArray(remote.messages) ? remote.messages : Array.isArray(base.messages) ? base.messages : [];
+  merged.notifications = Array.isArray(remote.notifications) ? remote.notifications : Array.isArray(base.notifications) ? base.notifications : [];
+  merged.feed = Array.isArray(remote.feed) ? remote.feed : Array.isArray(base.feed) ? base.feed : [];
+  return merged;
+}
 
 /* ---------- Persistent store (Firebase Firestore integration) ---------- */
 const firebaseConfig = {
@@ -340,20 +377,22 @@ function seedDB(){
 let isDbLoaded = false;
 
 async function loadDB() { 
+  const localSeed = readLocalDB() || seedDB();
   try {
     const docRef = firestoreDb.collection('appData').doc('mainDB');
     const docSnap = await docRef.get();
     
     if (docSnap.exists) {
-      DB = docSnap.data();
+      DB = mergeDbState(docSnap.data() || {}, localSeed);
     } else {
-      DB = seedDB();
+      DB = localSeed;
       await docRef.set(DB);
     }
     isDbLoaded = true;
   } catch(e) {
     console.error("Firebase load error, falling back to local:", e);
-    try{DB=JSON.parse(localStorage.getItem(DBK))||seedDB();}catch(ex){DB=seedDB();}
+    DB = localSeed;
+    isDbLoaded = false;
   }
   DB.notifications = DB.notifications||[]; 
   DB.feed = DB.feed||[]; 
@@ -365,7 +404,7 @@ async function loadDB() {
     if (!u) logout(); 
     else { 
       APP.user.name = u.name; 
-      APP.user.email = u.email;
+      APP.user.email = normalizeEmail(u.email);
       APP.user.role = u.role;
       localStorage.setItem('oc_user', JSON.stringify(APP.user));
       renderApp(); 
@@ -374,8 +413,20 @@ async function loadDB() {
 }
 
 function saveDB() { 
+  const safeDB = {
+    ...seedDB(),
+    ...(DB || {}),
+    users: (DB?.users || []).map(u => ({...u, email: normalizeEmail(u.email), pass: normalizePass(u.pass || '')})),
+    notifications: DB?.notifications || [],
+    feed: DB?.feed || [],
+    plans: DB?.plans || [],
+    nutri: DB?.nutri || [],
+    records: DB?.records || [],
+    messages: DB?.messages || []
+  };
+  DB = safeDB;
   localStorage.setItem(DBK, JSON.stringify(DB)); 
-  if (isDbLoaded) {
+  if (isDbLoaded && firestoreDb && firestoreDb.collection) {
     firestoreDb.collection('appData').doc('mainDB').set(DB)
       .catch(e => console.error("Firebase save error:", e));
   }
@@ -617,7 +668,7 @@ function renderAuth(){
   $('#authForm').dir = APP.lang==='ar'?'rtl':'ltr';
 }
 async function doLogin(){
-  const e=$('#liEmail').value.trim().toLowerCase(), p=$('#liPass').value;
+  const e=normalizeEmail($('#liEmail').value), p=normalizePass($('#liPass').value);
   if(!e||!p){ $('#authErr').innerHTML=`<div class="auth-err">${L().wrong}</div>`; return; }
 
   // Ensure Firebase data is fully loaded before checking credentials
@@ -628,9 +679,9 @@ async function doLogin(){
     if(loginBtn){ loginBtn.disabled=false; loginBtn.textContent=L().login; }
   }
 
-  const u=DB.users.find(x=>x.email.toLowerCase()===e && x.pass===p);
+  const u=(DB.users||[]).find(x => normalizeEmail(x.email)===e && normalizePass(x.pass || '')===p);
   if(!u){ $('#authErr').innerHTML=`<div class="auth-err">${L().wrong}</div>`; return; }
-  APP.user={id:u.id,name:u.name,email:u.email,role:u.role};
+  APP.user={id:u.id,name:u.name,email:normalizeEmail(u.email),role:u.role};
   localStorage.setItem('oc_user',JSON.stringify(APP.user));
   go(u.role==='admin'?'#/admin/dashboard':'#/client/dashboard'); route();
 }
@@ -867,11 +918,12 @@ function openClientModal(id){
 }
 function saveClient(id){
   const t=L();
-  const pass=$('#mcPass').value.trim();
-  const d={name:$('#mcName').value.trim(),email:$('#mcEmail').value.trim(),phone:$('#mcPhone').value.trim(),
+  const pass=normalizePass($('#mcPass').value);
+  const email=normalizeEmail($('#mcEmail').value);
+  const d={name:$('#mcName').value.trim(),email:email,phone:$('#mcPhone').value.trim(),
     age:+$('#mcAge').value||'',height:+$('#mcHeight').value||'',goal:$('#mcGoal').value,status:$('#mcStatus').value,notes:$('#mcNotes').value.trim(),gender:$('#mcGender').value};
   if(!d.name||!d.email||(!id&&pass.length<6)){ toast(t.fillCreds); return; }
-  const clash=DB.users.find(u=>u.email.toLowerCase()===d.email.toLowerCase()&&u.id!==id);
+  const clash=DB.users.find(u=>normalizeEmail(u.email)===d.email&&u.id!==id);
   if(clash){ toast(t.emailTaken); return; }
   const w=+$('#mcW').value;
   if(id){ const u=DB.users.find(u=>u.id===id); Object.assign(u,d); if(pass) u.pass=pass; }
